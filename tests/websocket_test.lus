@@ -1,0 +1,185 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. PACKAGES .. "/*", "network")
+package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+
+local ws = require("websocket")
+local web = require("web")
+
+-- Serves `app` on a free port for the duration of `body(port)`.
+local function with_server(app, body)
+    local server = network.tcp.bind("127.0.0.1", 0)
+    local _, port = server:getsockname()
+    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
+    local ok, err = catch body(port)
+    coroutine.close(serving)
+    server:close()
+    if not ok then
+        error(err, 0)
+    end
+end
+
+local function echo_app(log)
+    local app = web.app()
+    app:get("/echo", ws.route(function(conn, req)
+        for message, kind in conn:messages() do
+            if message == "bye" then
+                conn:close(4000, "done")
+                return
+            end
+            conn:send(message)
+        end
+        if log then log.closed = true end
+    end, { protocols = { "chat.v2", "chat.v1" } }))
+    return app
+end
+
+local function accept_key_test()
+    -- The example handshake of RFC 6455, section 1.3.
+    assert(ws.accept_key("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+end
+
+local function echo_test()
+    with_server(echo_app(), function(port)
+        local conn <close> = ws.connect(`ws://127.0.0.1:$port/echo`)
+        conn:send("héllo")
+        local message, kind = conn:receive()
+        assert(message == "héllo" and kind == "text")
+        local blob = vector.create(3)
+        vector.set(blob, 0, 0)
+        vector.set(blob, 1, 255)
+        vector.set(blob, 2, 128)
+        conn:send(blob)
+        message, kind = conn:receive()
+        assert(kind == "binary" and #message == 3 and vector.get(message, 1) == 255)
+    end)
+end
+
+local function large_messages_test()
+    with_server(echo_app(), function(port)
+        local conn <close> = ws.connect(`ws://127.0.0.1:$port/echo`)
+        for _, size in ipairs({ 125, 126, 65535, 65536, 300000 }) do
+            local data = vector.create(size)
+            for i = 0, size - 1, 997 do
+                vector.set(data, i, i % 251)
+            end
+            conn:send(data)
+            local back = conn:receive()
+            assert(#back == size, `size $size`)
+            for i = 0, size - 1, 997 do
+                assert(vector.get(back, i) == i % 251)
+            end
+        end
+    end)
+end
+
+local function close_from_server_test()
+    with_server(echo_app(), function(port)
+        local conn = ws.connect(`ws://127.0.0.1:$port/echo`)
+        conn:send("bye")
+        local message, code, reason = conn:receive()
+        assert(message == nil and code == 4000 and reason == "done")
+        assert(not catch conn:send("late"))
+    end)
+end
+
+local function close_from_client_test()
+    local log = {}
+    with_server(echo_app(log), function(port)
+        local conn = ws.connect(`ws://127.0.0.1:$port/echo`)
+        conn:send("x")
+        conn:receive()
+        conn:close()
+        -- A second request lets the server coroutine finish its loop.
+        local again <close> = ws.connect(`ws://127.0.0.1:$port/echo`)
+        again:send("y")
+        assert(again:receive() == "y")
+    end)
+    assert(log.closed)
+end
+
+local function protocol_test()
+    with_server(echo_app(), function(port)
+        local conn <close> = ws.connect(`ws://127.0.0.1:$port/echo`, { protocols = { "chat.v1", "chat.v2" } })
+        assert(conn.protocol == "chat.v2")
+    end)
+end
+
+local function bad_handshake_test()
+    local app = echo_app()
+    local res = app:inject({ path = "/echo" })
+    assert(res.status == 400)
+    res = app:inject({ path = "/echo", headers = {
+        Upgrade = "websocket", Connection = "Upgrade", ["Sec-WebSocket-Key"] = "x", ["Sec-WebSocket-Version"] = "8",
+    } })
+    assert(res.status == 426)
+    with_server(app, function(port)
+        local ok, err = catch ws.connect(`ws://127.0.0.1:$port/missing`)
+        assert(not ok and err:find("status 404", 1, true))
+    end)
+end
+
+-- Returns the header of a client frame with a payload of at most 125 bytes.
+-- The tests mask payloads with the zero mask, which leaves them readable.
+local function raw_frame(fin, opcode, payload)
+    return string.pack(">BB", (fin and 0x80 or 0) | opcode, 0x80 | #payload)
+end
+
+local function raw_client(port)
+    local sock = network.tcp.connect("127.0.0.1", port)
+    sock:send("GET /echo HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    repeat
+        local line = sock:receive("*l")
+    until #line == 0
+    local function send(fin, opcode, text)
+        local head = raw_frame(fin, opcode, text)
+        sock:send(head)
+        sock:send(string.pack(">I4", 0))
+        sock:send(text)
+    end
+    return sock, send
+end
+
+local function fragmented_and_ping_test()
+    with_server(echo_app(), function(port)
+        local sock <close>, send = raw_client(port)
+        send(false, 1, "frag")
+        send(true, 9, "p")
+        send(false, 0, "men")
+        send(true, 0, "ted")
+        -- The pong to the ping arrives first, then the echo of the whole message.
+        local pong = sock:receive(3)
+        assert(vector.get(pong, 0) == 0x8A and vector.get(pong, 1) == 1 and vector.get(pong, 2) == string.byte("p"))
+        local head = sock:receive(2)
+        assert(vector.get(head, 0) == 0x81 and vector.get(head, 1) == 10)
+        assert(vector.tostring(sock:receive(10)) == "fragmented")
+    end)
+end
+
+local function unmasked_client_frame_test()
+    with_server(echo_app(), function(port)
+        local sock <close> = raw_client(port)
+        sock:send(string.pack(">BB", 0x81, 1))
+        sock:send("x")
+        local head = sock:receive(2)
+        assert(vector.get(head, 0) == 0x88)
+        local code = vector.unpack(sock:receive(vector.get(head, 1)), 0, ">I2")
+        assert(code == 1002)
+    end)
+end
+
+local function invalid_utf8_test()
+    with_server(echo_app(), function(port)
+        local sock <close> = raw_client(port)
+        local bad = vector.create(1)
+        vector.set(bad, 0, 0xFF)
+        local head = string.pack(">BB", 0x81, 0x81)
+        sock:send(head)
+        sock:send(string.pack(">I4", 0))
+        sock:send(bad)
+        local close_head = sock:receive(2)
+        assert(vector.get(close_head, 0) == 0x88)
+        assert(vector.unpack(sock:receive(vector.get(close_head, 1)), 0, ">I2") == 1007)
+    end)
+end
