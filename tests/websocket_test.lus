@@ -7,10 +7,10 @@ local ws = require("websocket")
 local web = require("web")
 
 -- Serves `app` on a free port for the duration of `body(port)`.
-local function with_server(app, body)
+local function with_server(app, body, options)
     local server = network.tcp.bind("127.0.0.1", 0)
     local _, port = server:getsockname()
-    local serving = coroutine.detach(coroutine.create(function() app:listen(server) end))
+    local serving = coroutine.detach(coroutine.create(function() app:listen(server, options) end))
     local ok, err = catch body(port)
     coroutine.close(serving)
     server:close()
@@ -182,4 +182,95 @@ local function invalid_utf8_test()
         assert(vector.get(close_head, 0) == 0x88)
         assert(vector.unpack(sock:receive(vector.get(close_head, 1)), 0, ">I2") == 1007)
     end)
+end
+
+-- A certificate authority and a certificate for localhost that exist for
+-- these tests alone. The private key below protects nothing.
+local TEST_CA = [[
+-----BEGIN CERTIFICATE-----
+MIIBOjCB4KADAgECAgkArFZh7wvzjlIwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwE
+dGVzdDAgFw0yNjExMjIyMDMxMzlaGA8yMTI2MTAyOTIwMzEzOVowDzENMAsGA1UE
+AwwEdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKnZpJDxX4L12/+CUmQ0
+avXBuiAqxtui96/+nJlM9h5zkRhDwGap5hfan36TbSaMJL0j5+/LRRwu5i4mD4/c
+6rajIzAhMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49
+BAMCA0kAMEYCIQC7KTov+iRa/nHXGL9S6TRrc3lsa1PGhAFTbkeQcwT6/wIhAOou
+z0VsnonOQohEYCoMNNg+GJvmZnIl3Gmef+PnTaJp
+-----END CERTIFICATE-----
+]]
+
+local TEST_CERT = [[
+-----BEGIN CERTIFICATE-----
+MIIBSTCB8KADAgECAgkAg9hAGvC0HYIwCgYIKoZIzj0EAwIwDzENMAsGA1UEAwwE
+dGVzdDAgFw0yNjExMjIyMDMxMzlaGA8yMTI2MTAyOTIwMzEzOVowDzENMAsGA1UE
+AwwEdGVzdDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABImuymK5UZZZrjzTNl34
+O6Bwf1nGvh/7KWuhpdcB8bH02ikuOG1mWfszlyimheUe1snDIsCYrNCF+WvBTamh
+W6OjMzAxMBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATATBgNVHSUEDDAKBggr
+BgEFBQcDATAKBggqhkjOPQQDAgNIADBFAiBRwzdnWxmM2wQm0Ew0ikUBO7fhDoK6
+iT0nJlb6EfVKGwIhAIuiVCUsUsAiyR+ez3RewleOvD2QWUAx68coQj9QGpZh
+-----END CERTIFICATE-----
+]]
+
+local TEST_KEY = [[
+-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEICc9PEBZG/695GHAWhyQnfwP/P8qs1KeHJdPwJWL7DHcoAoGCCqGSM49
+AwEHoUQDQgAEia7KYrlRllmuPNM2Xfg7oHB/Wca+H/spa6Gl1wHxsfTaKS44bWZZ
++zOXKKaF5R7WycMiwJis0IX5a8FNqaFbow==
+-----END EC PRIVATE KEY-----
+]]
+
+local function wss_test()
+    with_server(echo_app(), function(port)
+        local conn <close> = ws.connect(`wss://localhost:$port/echo`, { tls = { ca = TEST_CA }, timeout = 5 })
+        conn:send("over TLS")
+        assert(conn:receive() == "over TLS")
+        local ok, err = catch ws.connect(`wss://localhost:$port/echo`, { tls = { ca = TEST_CA, servername = "other.test" } })
+        assert(not ok and err:find("websocket: certificate verification failed for other.test", 1, true), err)
+    end, { tls = { cert = TEST_CERT, key = TEST_KEY } })
+end
+
+local function refused_connection_test()
+    local server = network.tcp.bind("127.0.0.1", 0)
+    local _, port = server:getsockname()
+    server:close()
+    local ok, err = catch ws.connect(`ws://127.0.0.1:$port/echo`)
+    assert(not ok and err:find("websocket: cannot connect to 127.0.0.1", 1, true), err)
+end
+
+local function receive_timeout_test()
+    local app = web.app()
+    local seen = {}
+    app:get("/slow", ws.route(function(conn)
+        local ok, err = catch conn:receive()
+        seen.timeout = not ok and ws.iserror(err) and err.code
+        -- The connection survives the timeout.
+        conn:send("still here")
+        seen.message = conn:receive()
+    end, { timeout = 0.05 }))
+    with_server(app, function(port)
+        local conn <close> = ws.connect(`ws://127.0.0.1:$port/slow`, { timeout = 5 })
+        assert(conn:receive() == "still here")
+        conn:send("late")
+        conn:receive()
+    end)
+    assert(seen.timeout == "timeout" and seen.message == "late")
+end
+
+local function lost_connection_test()
+    -- A client whose server ends the stream without a close frame.
+    local listener <close> = network.tcp.bind("127.0.0.1", 0)
+    local _, port = listener:getsockname()
+    local serving = coroutine.detach(coroutine.create(function()
+        local sock <close> = listener:accept()
+        local key
+        repeat
+            local line = vector.tostring(sock:receive("*l"))
+            key = line:match("^Sec%-WebSocket%-Key: (.+)$") or key
+        until line == ""
+        sock:send("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            .. `Sec-WebSocket-Accept: $(ws.accept_key(key))\r\n\r\n`)
+    end))
+    local conn <close> = ws.connect(`ws://127.0.0.1:$port/`)
+    local message, code, reason = conn:receive()
+    assert(message == nil and code == 1006 and reason == "connection closed", reason)
+    coroutine.close(serving)
 end

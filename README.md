@@ -1,6 +1,6 @@
 # websocket
 
-`websocket` implements the WebSocket protocol of RFC 6455 for servers on `web` or `network.serve` and for clients.
+`websocket` implements the WebSocket protocol of RFC 6455 for servers on `web` or `network.serve` and for clients of `ws://` and `wss://` URLs.
 
 The following example adds an endpoint to a web application that sends every message back to its client.
 
