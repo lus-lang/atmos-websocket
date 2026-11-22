@@ -21,8 +21,8 @@ end
 
 local function echo_app(log)
     local app = web.app()
-    app:get("/echo", ws.route(function(conn, req)
-        for message, kind in conn:messages() do
+    app:get("/echo", ws.route(function(conn, _req)
+        for message, _kind in conn:messages() do
             if message == "bye" then
                 conn:close(4000, "done")
                 return
