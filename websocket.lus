@@ -1,13 +1,13 @@
---- Speaks the WebSocket protocol of RFC 6455, as a server and as a client.
+--- Implements the WebSocket protocol of RFC 6455 for servers and clients.
 ---
 --- `websocket.route` turns a function into a `web` or `network.serve`
 --- handler that accepts WebSocket connections. `websocket.connect` opens a
---- client connection. Both give a connection object whose `receive` and
---- `send` exchange whole messages. A connection waits inside its own
---- coroutine, so one program holds many connections.
+--- client connection. Both produce a connection object whose `receive` and
+--- `send` methods read and write whole messages. Each connection runs in
+--- its own coroutine, so one program can keep many connections open.
 ---
 --- @package websocket
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-websocket
@@ -220,10 +220,10 @@ end
 --- Waits for the next message and returns it.
 ---
 --- A text message returns a string and `"text"`. A binary message returns a
---- vector and `"binary"`. The connection answers pings by itself and joins
---- fragmented messages. When the other end closes the connection, `receive`
---- answers the close and returns `nil`, the close code, and the reason. A
---- protocol violation sends the matching close frame and raises an error
+--- vector and `"binary"`. `receive` answers pings and joins fragmented
+--- messages. When the other end closes the connection, `receive` answers the
+--- close and returns `nil`, the close code, and the reason. On a protocol
+--- violation, `receive` sends the matching close frame and raises an error
 --- object with that code: 1002 for a malformed frame, 1007 for text that is
 --- not UTF-8, and 1009 for a message longer than `max_message`.
 --- @return string|vector|nil The message.
@@ -380,16 +380,16 @@ end
 
 --- Returns a request handler that accepts WebSocket connections.
 ---
---- The handler suits `web` routes and `network.serve` alike. A request that
---- is not a WebSocket handshake gets 400, and a handshake with a version
+--- The handler works for both `web` routes and `network.serve`. A request
+--- that is not a WebSocket handshake gets 400. A handshake with a version
 --- other than 13 gets 426. Otherwise the handler answers 101 and the runtime
 --- calls `fn(conn, req)` with the connection once the response is written.
 --- The connection closes when `fn` returns. `options.protocols` lists the
---- subprotocols that the server speaks, and the first one that the client
+--- subprotocols that the server supports. The first one that the client
 --- also offers is chosen and stored in `conn.protocol`. `options.max_message`
 --- limits the size of a message and defaults to 16 MiB. `options.timeout`
---- sets the seconds that `receive` waits, and defaults to waiting without
---- limit.
+--- is the number of seconds that `receive` waits. By default `receive`
+--- waits without limit.
 --- @param fn function The function that serves one connection.
 --- @param options table? The options.
 --- @return function
@@ -435,8 +435,8 @@ end
 --- `options.headers` adds request headers, `options.protocols` offers
 --- subprotocols, and `options.max_message` limits the size of a message.
 --- A failed handshake raises an error that names the status of the
---- response. `wss://` URLs need TLS sockets, which the standard library does
---- not provide, so they raise an error.
+--- response. A `wss://` URL raises an error, because it needs TLS sockets
+--- and the standard library provides none.
 --- @param url string The URL.
 --- @param options table? The options.
 --- @return table The connection.
