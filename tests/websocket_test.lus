@@ -10,10 +10,15 @@ local web = require("web")
 local function with_server(app, body, options)
     local server = network.tcp.bind("127.0.0.1", 0)
     local _, port = server:getsockname()
-    local serving = coroutine.detach(coroutine.create(function() app:listen(server, options) end))
+
+    local serving = coroutine.detach(coroutine.create(function()
+        app:listen(server, options)
+    end))
+
     local ok, err = catch body(port)
     coroutine.close(serving)
     server:close()
+
     if not ok then
         error(err, 0)
     end
@@ -21,16 +26,22 @@ end
 
 local function echo_app(log)
     local app = web.app()
+
     app:get("/echo", ws.route(function(conn, _req)
         for message, _kind in conn:messages() do
             if message == "bye" then
                 conn:close(4000, "done")
                 return
             end
+
             conn:send(message)
         end
-        if log then log.closed = true end
+
+        if log then
+            log.closed = true
+        end
     end, { protocols = { "chat.v2", "chat.v1" } }))
+
     return app
 end
 
@@ -58,14 +69,18 @@ end
 local function large_messages_test()
     with_server(echo_app(), function(port)
         local conn <close> = ws.connect(`ws://127.0.0.1:$port/echo`)
+
         for _, size in ipairs({ 125, 126, 65535, 65536, 300000 }) do
             local data = vector.create(size)
+
             for i = 0, size - 1, 997 do
                 vector.set(data, i, i % 251)
             end
+
             conn:send(data)
             local back = conn:receive()
             assert(#back == size, `size $size`)
+
             for i = 0, size - 1, 997 do
                 assert(vector.get(back, i) == i % 251)
             end
@@ -85,6 +100,7 @@ end
 
 local function close_from_client_test()
     local log = {}
+
     with_server(echo_app(log), function(port)
         local conn = ws.connect(`ws://127.0.0.1:$port/echo`)
         conn:send("x")
@@ -95,12 +111,15 @@ local function close_from_client_test()
         again:send("y")
         assert(again:receive() == "y")
     end)
+
     assert(log.closed)
 end
 
 local function protocol_test()
     with_server(echo_app(), function(port)
-        local conn <close> = ws.connect(`ws://127.0.0.1:$port/echo`, { protocols = { "chat.v1", "chat.v2" } })
+        local conn <close> = ws.connect(`ws://127.0.0.1:$port/echo`, {
+            protocols = { "chat.v1", "chat.v2" },
+        })
         assert(conn.protocol == "chat.v2")
     end)
 end
@@ -110,9 +129,13 @@ local function bad_handshake_test()
     local res = app:inject({ path = "/echo" })
     assert(res.status == 400)
     res = app:inject({ path = "/echo", headers = {
-        Upgrade = "websocket", Connection = "Upgrade", ["Sec-WebSocket-Key"] = "x", ["Sec-WebSocket-Version"] = "8",
+        Upgrade = "websocket",
+        Connection = "Upgrade",
+        ["Sec-WebSocket-Key"] = "x",
+        ["Sec-WebSocket-Version"] = "8",
     } })
     assert(res.status == 426)
+
     with_server(app, function(port)
         local ok, err = catch ws.connect(`ws://127.0.0.1:$port/missing`)
         assert(not ok and err:find("status 404", 1, true))
@@ -127,17 +150,22 @@ end
 
 local function raw_client(port)
     local sock = network.tcp.connect("127.0.0.1", port)
-    sock:send("GET /echo HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    sock:send(
+        "GET /echo HTTP/1.1\r\nHost: l\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            .. "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    )
+
     repeat
         local line = sock:receive("*l")
     until #line == 0
+
     local function send(fin, opcode, text)
         local head = raw_frame(fin, opcode, text)
         sock:send(head)
         sock:send(string.pack(">I4", 0))
         sock:send(text)
     end
+
     return sock, send
 end
 
@@ -150,7 +178,11 @@ local function fragmented_and_ping_test()
         send(true, 0, "ted")
         -- The pong to the ping arrives first, then the echo of the whole message.
         local pong = sock:receive(3)
-        assert(vector.get(pong, 0) == 0x8A and vector.get(pong, 1) == 1 and vector.get(pong, 2) == string.byte("p"))
+        assert(
+            vector.get(pong, 0) == 0x8A
+                and vector.get(pong, 1) == 1
+                and vector.get(pong, 2) == string.byte("p")
+        )
         local head = sock:receive(2)
         assert(vector.get(head, 0) == 0x81 and vector.get(head, 1) == 10)
         assert(vector.tostring(sock:receive(10)) == "fragmented")
@@ -220,11 +252,20 @@ AwEHoUQDQgAEia7KYrlRllmuPNM2Xfg7oHB/Wca+H/spa6Gl1wHxsfTaKS44bWZZ
 
 local function wss_test()
     with_server(echo_app(), function(port)
-        local conn <close> = ws.connect(`wss://localhost:$port/echo`, { tls = { ca = TEST_CA }, timeout = 5 })
+        local conn <close> = ws.connect(`wss://localhost:$port/echo`, {
+            tls = { ca = TEST_CA },
+            timeout = 5,
+        })
         conn:send("over TLS")
         assert(conn:receive() == "over TLS")
-        local ok, err = catch ws.connect(`wss://localhost:$port/echo`, { tls = { ca = TEST_CA, servername = "other.test" } })
-        assert(not ok and err:find("websocket: certificate verification failed for other.test", 1, true), err)
+        local ok, err = catch ws.connect(`wss://localhost:$port/echo`, {
+            tls = { ca = TEST_CA, servername = "other.test" },
+        })
+        assert(
+            not ok
+                and err:find("websocket: certificate verification failed for other.test", 1, true),
+            err
+        )
     end, { tls = { cert = TEST_CERT, key = TEST_KEY } })
 end
 
@@ -239,6 +280,7 @@ end
 local function receive_timeout_test()
     local app = web.app()
     local seen = {}
+
     app:get("/slow", ws.route(function(conn)
         local ok, err = catch conn:receive()
         seen.timeout = not ok and ws.iserror(err) and err.code
@@ -246,12 +288,14 @@ local function receive_timeout_test()
         conn:send("still here")
         seen.message = conn:receive()
     end, { timeout = 0.05 }))
+
     with_server(app, function(port)
         local conn <close> = ws.connect(`ws://127.0.0.1:$port/slow`, { timeout = 5 })
         assert(conn:receive() == "still here")
         conn:send("late")
         conn:receive()
     end)
+
     assert(seen.timeout == "timeout" and seen.message == "late")
 end
 
@@ -259,16 +303,22 @@ local function lost_connection_test()
     -- A client whose server ends the stream without a close frame.
     local listener <close> = network.tcp.bind("127.0.0.1", 0)
     local _, port = listener:getsockname()
+
     local serving = coroutine.detach(coroutine.create(function()
         local sock <close> = listener:accept()
         local key
+
         repeat
             local line = vector.tostring(sock:receive("*l"))
             key = line:match("^Sec%-WebSocket%-Key: (.+)$") or key
         until line == ""
-        sock:send("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            .. `Sec-WebSocket-Accept: $(ws.accept_key(key))\r\n\r\n`)
+
+        sock:send(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                .. `Sec-WebSocket-Accept: $(ws.accept_key(key))\r\n\r\n`
+        )
     end))
+
     local conn <close> = ws.connect(`ws://127.0.0.1:$port/`)
     local message, code, reason = conn:receive()
     assert(message == nil and code == 1006 and reason == "connection closed", reason)

@@ -6,6 +6,22 @@
 --- `send` methods read and write whole messages. Each connection runs in
 --- its own coroutine, so one program can keep many connections open.
 ---
+--- The following example adds an endpoint to a web application that sends
+--- every message back to its client.
+---
+--- ```lus nocheck
+--- local web = require("https://atmosp.here/2.0/web.lus")
+--- local ws = require("https://atmosp.here/2.0/websocket.lus")
+---
+--- local app = web.app()
+---
+--- app:get("/echo", ws.route(function(conn)
+---     for message in conn:messages() do
+---         conn:send(message)
+---     end
+--- end))
+--- ```
+---
 --- @package websocket
 --- @version 1.0.0
 --- @lus 2.0
@@ -25,7 +41,10 @@ local DEFAULT_MAX = 16 * 1024 * 1024
 
 local WsError = {}
 WsError.__index = WsError
-WsError.__tostring = function(e) return e.message end
+
+WsError.__tostring = function(e)
+    return e.message
+end
 
 local function protocol_error(code, message)
     error(setmetatable({ code = code, message = message }, WsError), 0)
@@ -49,10 +68,12 @@ local function apply_mask(data, mask)
     local n = #data
     local m32 = vector.unpack(mask, 0, ">I4")
     local i = 0
+
     while i + 4 <= n do
         vector.pack(data, i, ">I4", vector.unpack(data, i, ">I4") ~ m32)
         i = i + 4
     end
+
     while i < n do
         vector.set(data, i, vector.get(data, i) ~ vector.get(mask, i % 4))
         i = i + 1
@@ -63,21 +84,27 @@ local function concat(parts, total)
     if #parts == 1 then
         return parts[1]
     end
+
     local out = vector.create(total)
     local offset = 0
+
     for _, part in ipairs(parts) do
         local n = #part
         local i = 0
+
         while i + 8 <= n do
             vector.pack(out, offset + i, "<I8", vector.unpack(part, i, "<I8"))
             i = i + 8
         end
+
         while i < n do
             vector.set(out, offset + i, vector.get(part, i))
             i = i + 1
         end
+
         offset = offset + n
     end
+
     return out
 end
 
@@ -101,15 +128,17 @@ local function new_conn(sock, client, options)
     return setmetatable({
         sock = sock,
         client = client,
-        max = options and options.max_message or DEFAULT_MAX,
+        max = options?.max_message or DEFAULT_MAX,
         closed = false,
         close_sent = false,
-        protocol = options and options.protocol,
+        protocol = options?.protocol,
     }, Conn)
 end
 
 local CLOSED = setmetatable({ code = "closed", message = "connection closed" }, {
-    __tostring = function(e) return e.message end,
+    __tostring = function(e)
+        return e.message
+    end,
 })
 
 -- Reads exactly `n` bytes, or returns nil and the error object of the
@@ -118,18 +147,23 @@ local function read_exact(sock, n)
     if n == 0 then
         return vector.create(0)
     end
+
     local parts, total = {}, 0
+
     while total < n do
         local chunk = math.min(n - total, 1024 * 1024)
         local data, err = sock:receive(chunk)
+
         if data == nil then
             return nil, err
         elseif #data == 0 then
             return nil, CLOSED
         end
+
         parts[#parts + 1] = data
         total = total + #data
     end
+
     return concat(parts, total)
 end
 
@@ -137,6 +171,7 @@ function Conn:write_frame(opcode, payload)
     local n = #payload
     local header
     local mask_bit = self.client and 0x80 or 0
+
     if n < 126 then
         header = string.pack(">BB", 0x80 | opcode, mask_bit | n)
     elseif n < 65536 then
@@ -144,22 +179,35 @@ function Conn:write_frame(opcode, payload)
     else
         header = string.pack(">BBI8", 0x80 | opcode, mask_bit | 127, n)
     end
+
     local ok, err
+
     if self.client then
         local mask = crypto.random(4)
         local masked = vector.clone(payload)
         apply_mask(masked, mask)
         ok, err = self.sock:send(header)
-        if ok then ok, err = self.sock:send(mask) end
-        if ok and n > 0 then ok, err = self.sock:send(masked) end
+
+        if ok then
+            ok, err = self.sock:send(mask)
+        end
+
+        if ok and n > 0 then
+            ok, err = self.sock:send(masked)
+        end
     else
         ok, err = self.sock:send(header)
-        if ok and n > 0 then ok, err = self.sock:send(payload) end
+
+        if ok and n > 0 then
+            ok, err = self.sock:send(payload)
+        end
     end
+
     if not ok then
         self.closed = true
         return nil, tostring(err)
     end
+
     return true
 end
 
@@ -168,51 +216,80 @@ end
 -- frame ran out before any of it was read, so the connection is intact.
 function Conn:read_frame()
     local head, err = read_exact(self.sock, 2)
+
     if head == nil then
         return nil, err, err.code == "timeout"
     end
+
     local b1, b2 = vector.get(head, 0), vector.get(head, 1)
     local fin = b1 & 0x80 ~= 0
+
     if b1 & 0x70 ~= 0 then
         protocol_error(1002, "reserved bits set")
     end
+
     local opcode = b1 & 0x0F
     local masked = b2 & 0x80 ~= 0
     local len = b2 & 0x7F
+
     if masked == self.client then
-        protocol_error(1002, self.client and "server frame is masked" or "client frame is not masked")
+        protocol_error(
+            1002,
+            self.client and "server frame is masked" or "client frame is not masked"
+        )
     end
+
     if opcode >= 8 and (len > 125 or not fin) then
         protocol_error(1002, "invalid control frame")
     end
+
     if len == 126 then
         local ext, failure = read_exact(self.sock, 2)
-        if ext == nil then return nil, failure end
+
+        if ext == nil then
+            return nil, failure
+        end
+
         len = vector.unpack(ext, 0, ">I2")
     elseif len == 127 then
         local ext, failure = read_exact(self.sock, 8)
-        if ext == nil then return nil, failure end
+
+        if ext == nil then
+            return nil, failure
+        end
+
         len = vector.unpack(ext, 0, ">i8")
+
         if len < 0 then
             protocol_error(1002, "invalid frame length")
         end
     end
+
     if len > self.max then
         protocol_error(1009, "message too big")
     end
+
     local mask
+
     if masked then
         local failure
         mask, failure = read_exact(self.sock, 4)
-        if mask == nil then return nil, failure end
+
+        if mask == nil then
+            return nil, failure
+        end
     end
+
     local payload, failure = read_exact(self.sock, len)
+
     if payload == nil then
         return nil, failure
     end
+
     if mask then
         apply_mask(payload, mask)
     end
+
     return fin, opcode, payload
 end
 
@@ -220,12 +297,15 @@ local function close_payload(code, reason)
     if code == nil then
         return vector.create(0)
     end
+
     local reason_bytes = vector.fromstring(reason or "")
     local out = vector.create(2 + #reason_bytes)
     vector.pack(out, 0, ">I2", code)
+
     for i = 0, #reason_bytes - 1 do
         vector.set(out, 2 + i, vector.get(reason_bytes, i))
     end
+
     return out
 end
 
@@ -249,31 +329,46 @@ function Conn:receive()
     if self.closed then
         return nil, 1006, "connection closed"
     end
+
     local parts, total, kind = nil, 0, nil
+
     while true do
         local ok, fin, opcode, payload = catch self:read_frame()
+
         if not ok then
             local err = fin
+
             if getmetatable(err) == WsError then
                 self:close(err.code, err.message)
                 error(err, 0)
             end
+
             error(err, 0)
         end
+
         if fin == nil then
             if payload then
-                error(setmetatable({ code = "timeout", message = "websocket: receive timeout" }, WsError), 0)
+                error(
+                    setmetatable(
+                        { code = "timeout", message = "websocket: receive timeout" },
+                        WsError
+                    ),
+                    0
+                )
             end
+
             self.closed = true
             catch self.sock:close()
             return nil, 1006, tostring(opcode)
         end
+
         if opcode == OP_PING then
             self:write_frame(OP_PONG, payload)
         elseif opcode == OP_PONG then
             self.last_pong = payload
         elseif opcode == OP_CLOSE then
             local code, reason = 1005, ""
+
             if #payload >= 2 then
                 code = vector.unpack(payload, 0, ">I2")
                 local okr, text = catch vector.tostring(payload, 2)
@@ -281,10 +376,12 @@ function Conn:receive()
             elseif #payload == 1 then
                 code = 1002
             end
+
             if not self.close_sent then
                 self:write_frame(OP_CLOSE, close_payload(code == 1005 and 1000 or code, ""))
                 self.close_sent = true
             end
+
             self.closed = true
             self.sock:close()
             return nil, code, reason
@@ -293,6 +390,7 @@ function Conn:receive()
                 self:close(1002, "new message before the end of a fragmented one")
                 protocol_error(1002, "new message before the end of a fragmented one")
             end
+
             kind = opcode == OP_TEXT and "text" or "binary"
             parts, total = { payload }, #payload
         elseif opcode == OP_CONTINUATION then
@@ -300,8 +398,10 @@ function Conn:receive()
                 self:close(1002, "continuation without a message")
                 protocol_error(1002, "continuation without a message")
             end
+
             parts[#parts + 1] = payload
             total = total + #payload
+
             if total > self.max then
                 self:close(1009, "message too big")
                 protocol_error(1009, "message too big")
@@ -310,16 +410,21 @@ function Conn:receive()
             self:close(1002, "unknown opcode")
             protocol_error(1002, `unknown opcode $opcode`)
         end
+
         if fin and parts ~= nil and opcode ~= OP_PING and opcode ~= OP_PONG then
             local data = concat(parts, total)
+
             if kind == "text" then
                 local okt, text = catch vector.tostring(data)
+
                 if not okt then
                     self:close(1007, "invalid UTF-8")
                     protocol_error(1007, "text message is not valid UTF-8")
                 end
+
                 return text, "text"
             end
+
             return data, "binary"
         end
     end
@@ -332,11 +437,11 @@ end
 --- @return function
 function Conn:messages()
     return function()
-        local message, kind = self:receive()
-        if message == nil then
-            return nil
+        if message, kind = self:receive() then
+            return message, kind
         end
-        return message, kind
+
+        return nil
     end
 end
 
@@ -352,9 +457,11 @@ function Conn:send(data)
     if self.closed or self.close_sent then
         error("websocket: send on a closed connection", 2)
     end
+
     if type(data) == "string" then
         return self:write_frame(OP_TEXT, vector.fromstring(data))
     end
+
     return self:write_frame(OP_BINARY, data)
 end
 
@@ -365,9 +472,11 @@ end
 --- @param data string|vector? The data.
 function Conn:ping(data)
     local payload = type(data) == "string" and vector.fromstring(data) or data or vector.create(0)
+
     if #payload > 125 then
         error("websocket: ping data is longer than 125 bytes", 2)
     end
+
     return self:write_frame(OP_PING, payload)
 end
 
@@ -380,10 +489,12 @@ function Conn:close(code, reason)
     if self.closed then
         return
     end
+
     if not self.close_sent then
         self.close_sent = true
         catch self:write_frame(OP_CLOSE, close_payload(code or 1000, reason))
     end
+
     self.closed = true
     catch self.sock:close()
 end
@@ -395,7 +506,10 @@ end
 -- Server ------------------------------------------------------------------------
 
 local function bad_request(status, message)
-    return status, message .. "\n", { ["Content-Type"] = "text/plain; charset=utf-8", ["Sec-WebSocket-Version"] = "13" }
+    return status, `$message\n`, {
+        ["Content-Type"] = "text/plain; charset=utf-8",
+        ["Sec-WebSocket-Version"] = "13",
+    }
 end
 
 --- Returns a request handler that accepts WebSocket connections.
@@ -416,33 +530,47 @@ end
 function M.route(fn, options)
     options = options or {}
     local timeout = options.timeout
+
     return function(req)
         local h = req.headers
-        if req.method ~= "GET" or (h.upgrade or ""):lower() ~= "websocket"
-            or not (h.connection or ""):lower():find("upgrade", 1, true) or h["sec-websocket-key"] == nil then
+
+        if req.method ~= "GET"
+            or (h.upgrade or ""):lower() ~= "websocket"
+            or not (h.connection or ""):lower():find("upgrade", 1, true)
+            or h["sec-websocket-key"] == nil then
             return bad_request(400, "expected a WebSocket handshake")
         end
+
         if h["sec-websocket-version"] ~= "13" then
             return bad_request(426, "unsupported WebSocket version")
         end
+
         local headers = {}
         local protocol
+
         if options.protocols and h["sec-websocket-protocol"] then
             local offered = {}
+
             for p in h["sec-websocket-protocol"]:gmatch("[^,%s]+") do
                 offered[p] = true
             end
+
             for _, p in ipairs(options.protocols) do
                 if offered[p] then
                     protocol = p
                     break
                 end
             end
+
             headers["Sec-WebSocket-Protocol"] = protocol
         end
+
         return 101, function(sock)
             sock:settimeout(timeout)
-            local conn <close> = new_conn(sock, false, { max_message = options.max_message, protocol = protocol })
+            local conn <close> = new_conn(sock, false, {
+                max_message = options.max_message,
+                protocol = protocol,
+            })
             fn(conn, req)
         end, headers
     end
@@ -469,29 +597,33 @@ end
 function M.connect(url, options)
     options = options or {}
     local scheme, host, port, path = url:match("^(wss?)://([^:/]+):?(%d*)(.*)$")
+
     if scheme == nil then
         error(`websocket: invalid URL '$url'`, 2)
     end
+
     local secure = scheme == "wss"
     port = tonumber(port) or (secure and 443 or 80)
+
     if path == "" then
         path = "/"
     end
+
     local timeout = options.timeout
     local sock, failure
+
     if secure then
-        local tls = {}
-        for name, value in pairs(options.tls or {}) do
-            tls[name] = value
-        end
+        local tls = table.clone(options.tls or {})
         tls.timeout = timeout
         sock, failure = network.tls.connect(host, port, tls)
     else
         sock, failure = network.tcp.connect(host, port, timeout and { timeout = timeout })
     end
+
     if sock == nil then
-        error(`websocket: $(tostring(failure))`, 2)
+        error(`websocket: $failure`, 2)
     end
+
     local key = string.transcode(crypto.random(16), "binary", "base64")
     local lines = {
         `GET $path HTTP/1.1`,
@@ -501,43 +633,59 @@ function M.connect(url, options)
         `Sec-WebSocket-Key: $key`,
         "Sec-WebSocket-Version: 13",
     }
+
     if options.protocols then
-        lines[#lines + 1] = "Sec-WebSocket-Protocol: " .. table.concat(options.protocols, ", ")
+        lines[#lines + 1] = `Sec-WebSocket-Protocol: $(table.concat(options.protocols, ", "))`
     end
+
     for name, value in pairs(options.headers or {}) do
         lines[#lines + 1] = `$name: $value`
     end
-    local sent, err = sock:send(table.concat(lines, "\r\n") .. "\r\n\r\n")
+
+    local sent, err = sock:send(`$(table.concat(lines, "\r\n"))\r\n\r\n`)
     local status_line
+
     if sent then
         status_line, err = sock:receive("*l", 8192)
     end
+
     local status = status_line and vector.tostring(status_line):match("^HTTP/1%.1 (%d+)")
     local headers = {}
+
     while status_line do
         local line
         line, err = sock:receive("*l", 8192)
+
         if line == nil or #line == 0 then
             break
         end
+
         local name, value = vector.tostring(line):match("^([^:]+):%s*(.-)%s*$")
+
         if name then
             headers[name:lower()] = value
         end
     end
+
     if err then
         sock:close()
-        error(`websocket: handshake failed: $(tostring(err))`, 2)
+        error(`websocket: handshake failed: $err`, 2)
     end
+
     if status ~= "101" then
         sock:close()
         error(`websocket: handshake failed with status $(status or "none")`, 2)
     end
+
     if headers["sec-websocket-accept"] ~= accept_key(key) then
         sock:close()
         error("websocket: handshake has a wrong Sec-WebSocket-Accept", 2)
     end
-    return new_conn(sock, true, { max_message = options.max_message, protocol = headers["sec-websocket-protocol"] })
+
+    return new_conn(sock, true, {
+        max_message = options.max_message,
+        protocol = headers["sec-websocket-protocol"],
+    })
 end
 
 return M
